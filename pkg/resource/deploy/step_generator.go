@@ -1519,6 +1519,23 @@ func (sg *stepGenerator) generateStepsFromDiff(
 // calls into continueStepsFromDiff and then validateSteps to continue the work that GenerateSteps would have
 // done with a synchronous diff.
 func (sg *stepGenerator) ContinueStepsFromDiff(event ContinueResourceDiffEvent) ([]Step, error) {
+	// If we're re-entering the step generator we need to handle the case that another step generation that
+	// ran between this event starting and its diff returning has marked this resource deleted and it now
+	// needs to be re-created.
+	urn := event.URN()
+	if sg.deletes[urn] {
+		logging.V(7).Infof("Planner decided to re-create replaced resource '%v' deleted due to dependent DBR", urn)
+
+		// Unmark this resource as deleted, we now know it's being replaced instead.
+		delete(sg.deletes, urn)
+		sg.replaces[urn] = true
+		keys := sg.dependentReplaceKeys[urn]
+		return []Step{
+			NewReplaceStep(sg.deployment, event.Old(), event.New(), nil, nil, nil, false),
+			NewCreateReplacementStep(sg.deployment, event.Event(), event.Old(), event.New(), keys, nil, nil, false),
+		}, nil
+	}
+
 	updateSteps, err := sg.continueStepsFromDiff(event)
 	if err != nil {
 		return nil, err
@@ -1812,7 +1829,7 @@ func (sg *stepGenerator) isOperatedOn(urn resource.URN) bool {
 	if aliased {
 		urn = alias
 	}
-	return !sg.sames[urn] && !sg.updates[urn] && !sg.replaces[urn] && !sg.reads[urn] && !sg.refreshes[urn]
+	return sg.sames[urn] || sg.updates[urn] || sg.replaces[urn] || sg.reads[urn] || sg.refreshes[urn]
 	// NOTE: we deliberately do not check sg.deletes here, as it is possible for us to issue multiple
 	// delete steps for the same URN if the old checkpoint contained pending deletes.
 }
@@ -1832,7 +1849,7 @@ func (sg *stepGenerator) GenerateRefreshes(
 				continue
 			}
 
-			if sg.isOperatedOn(res.URN) {
+			if !sg.isOperatedOn(res.URN) {
 				// We also keep track of dependents as we find them in order to exclude
 				// transitive dependents as well.
 				var add bool
@@ -1887,6 +1904,34 @@ func (sg *stepGenerator) GenerateRefreshes(
 // registered in the new snapshot. It also generates delete steps for any resources that were marked for deletion
 // because of `destroy` mode.
 func (sg *stepGenerator) GenerateDeletes(targetsOpt UrnTargets, excludesOpt UrnTargets) ([]Step, error) {
+	// If -target was provided to either `pulumi update` or `pulumi destroy` then only delete
+	// resources that were specified.
+	var allowedResourcesToDelete map[resource.URN]bool
+	var forbiddenResourcesToDelete map[resource.URN]bool
+	var err error
+
+	if targetsOpt.IsConstrained() {
+		allowedResourcesToDelete, err = sg.determineAllowedResourcesToDeleteFromTargets(targetsOpt)
+	} else if excludesOpt.IsConstrained() {
+		forbiddenResourcesToDelete, err = sg.determineForbiddenResourcesToDeleteFromExcludes(excludesOpt)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	isTargeted := func(res *resource.State) bool {
+		if allowedResourcesToDelete != nil {
+			_, has := allowedResourcesToDelete[res.URN]
+			return has
+		}
+		if forbiddenResourcesToDelete != nil {
+			_, has := forbiddenResourcesToDelete[res.URN]
+			return !has
+		}
+		return true
+	}
+
 	// Doesn't matter what order we build this list of steps in as we'll sort them in ScheduleDeletes.
 	steps := slice.Prealloc[Step](len(sg.toDelete))
 	if prev := sg.deployment.prev; prev != nil {
@@ -1897,66 +1942,74 @@ func (sg *stepGenerator) GenerateDeletes(targetsOpt UrnTargets, excludesOpt UrnT
 				continue
 			}
 
-			// If this resource is explicitly marked for deletion or wasn't seen at all, delete it.
-			if res.Delete {
-				// The below assert is commented-out because it's believed to be wrong.
-				//
-				// The original justification for this assert is that the author (swgillespie) believed that
-				// it was impossible for a single URN to be deleted multiple times in the same program.
-				// This has empirically been proven to be false - it is possible using today engine to construct
-				// a series of actions that puts arbitrarily many pending delete resources with the same URN in
-				// the snapshot.
-				//
-				// It is not clear whether or not this is OK. I (swgillespie), the author of this comment, have
-				// seen no evidence that it is *not* OK. However, concerns were raised about what this means for
-				// structural resources, and so until that question is answered, I am leaving this comment and
-				// assert in the code.
-				//
-				// Regardless, it is better to admit strange behavior in corner cases than it is to crash the CLI
-				// whenever we see multiple deletes for the same URN.
-				// contract.Assert(!sg.deletes[res.URN])
-				if sg.pendingDeletes[res] {
-					logging.V(7).Infof(
-						"Planner ignoring pending-delete resource (%v, %v) that was already deleted", res.URN, res.ID)
-					continue
-				}
+			if isTargeted(res) {
+				// If this resource is explicitly marked for deletion or wasn't seen at all, delete it.
+				if res.Delete {
+					// The below assert is commented-out because it's believed to be wrong.
+					//
+					// The original justification for this assert is that the author (swgillespie) believed that
+					// it was impossible for a single URN to be deleted multiple times in the same program.
+					// This has empirically been proven to be false - it is possible using today engine to construct
+					// a series of actions that puts arbitrarily many pending delete resources with the same URN in
+					// the snapshot.
+					//
+					// It is not clear whether or not this is OK. I (swgillespie), the author of this comment, have
+					// seen no evidence that it is *not* OK. However, concerns were raised about what this means for
+					// structural resources, and so until that question is answered, I am leaving this comment and
+					// assert in the code.
+					//
+					// Regardless, it is better to admit strange behavior in corner cases than it is to crash the CLI
+					// whenever we see multiple deletes for the same URN.
+					// contract.Assert(!sg.deletes[res.URN])
+					if sg.pendingDeletes[res] {
+						logging.V(7).Infof(
+							"Planner ignoring pending-delete resource (%v, %v) that was already deleted", res.URN, res.ID)
+						continue
+					}
 
-				if sg.deletes[res.URN] {
-					logging.V(7).Infof(
-						"Planner is deleting pending-delete urn '%v' that has already been deleted", res.URN)
-				}
+					if sg.deletes[res.URN] {
+						logging.V(7).Infof(
+							"Planner is deleting pending-delete urn '%v' that has already been deleted", res.URN)
+					}
 
-				logging.V(7).Infof("Planner decided to delete '%v' due to replacement", res.URN)
-				sg.deletes[res.URN] = true
-				oldViews := sg.deployment.GetOldViews(res.URN)
-				steps = append(steps, NewDeleteReplacementStep(sg.deployment, sg.deletes, res, false, oldViews))
-			} else if sg.isOperatedOn(res.URN) {
-				logging.V(7).Infof("Planner decided to delete '%v'", res.URN)
-				sg.deletes[res.URN] = true
-				if !res.PendingReplacement {
+					logging.V(7).Infof("Planner decided to delete '%v' due to replacement", res.URN)
+					sg.deletes[res.URN] = true
 					oldViews := sg.deployment.GetOldViews(res.URN)
-					steps = append(steps, NewDeleteStep(sg.deployment, sg.deletes, res, oldViews))
-				} else {
-					steps = append(steps, NewRemovePendingReplaceStep(sg.deployment, res))
+					steps = append(steps, NewDeleteReplacementStep(sg.deployment, sg.deletes, res, false, oldViews))
+				} else if !sg.isOperatedOn(res.URN) {
+					logging.V(7).Infof("Planner decided to delete '%v'", res.URN)
+					sg.deletes[res.URN] = true
+					if !res.PendingReplacement {
+						oldViews := sg.deployment.GetOldViews(res.URN)
+						steps = append(steps, NewDeleteStep(sg.deployment, sg.deletes, res, oldViews))
+					} else {
+						steps = append(steps, NewRemovePendingReplaceStep(sg.deployment, res))
+					}
 				}
-			}
 
-			// We just added a Delete step, so we need to ensure the provider for this resource is available.
-			if sg.deletes[res.URN] {
-				err := sg.deployment.EnsureProvider(res.Provider)
-				if err != nil {
-					return nil, fmt.Errorf("could not load provider for resource %v: %w", res.URN, err)
+				// We just added a Delete step, so we need to ensure the provider for this resource is available.
+				if sg.deletes[res.URN] {
+					err := sg.deployment.EnsureProvider(res.Provider)
+					if err != nil {
+						return nil, fmt.Errorf("could not load provider for resource %v: %w", res.URN, err)
+					}
 				}
+			} else {
+				// Add this resource to the deployment.news so that it shows up in analysis.
+				sg.deployment.news.Store(res.URN, res)
 			}
 		}
 	}
 
 	// We also need to delete all the new resources that we created/updated/samed if this is a destroy
-	// operation.
+	// operation. If a resource isn't targeted at this point it means it's already had a same step generated
+	// for it, and so we don't need to handle it (unlike in the loop above).
 	for _, res := range sg.toDelete {
-		sg.deletes[res.URN] = true
-		oldViews := sg.deployment.GetOldViews(res.URN)
-		steps = append(steps, NewDeleteStep(sg.deployment, sg.deletes, res, oldViews))
+		if isTargeted(res) {
+			sg.deletes[res.URN] = true
+			oldViews := sg.deployment.GetOldViews(res.URN)
+			steps = append(steps, NewDeleteStep(sg.deployment, sg.deletes, res, oldViews))
+		}
 	}
 
 	// Check each proposed delete against the relevant resource plan
@@ -1994,49 +2047,6 @@ func (sg *stepGenerator) GenerateDeletes(targetsOpt UrnTargets, excludesOpt UrnT
 			}
 			resourcePlan.Ops = append(resourcePlan.Ops, s.Op())
 		}
-	}
-
-	// If -target was provided to either `pulumi update` or `pulumi destroy` then only delete
-	// resources that were specified.
-	var allowedResourcesToDelete map[resource.URN]bool
-	var forbiddenResourcesToDelete map[resource.URN]bool
-	var err error
-
-	if targetsOpt.IsConstrained() {
-		allowedResourcesToDelete, err = sg.determineAllowedResourcesToDeleteFromTargets(targetsOpt)
-	} else if excludesOpt.IsConstrained() {
-		forbiddenResourcesToDelete, err = sg.determineForbiddenResourcesToDeleteFromExcludes(excludesOpt)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	if allowedResourcesToDelete != nil {
-		filtered := []Step{}
-		for _, step := range steps {
-			if _, has := allowedResourcesToDelete[step.URN()]; has {
-				filtered = append(filtered, step)
-			} else {
-				// Add this step to the deployment.news so that it shows up in analysis.
-				sg.deployment.news.Store(step.URN(), step.Old())
-			}
-		}
-
-		steps = filtered
-	}
-
-	if forbiddenResourcesToDelete != nil {
-		filtered := []Step{}
-		for _, step := range steps {
-			if _, has := forbiddenResourcesToDelete[step.URN()]; !has {
-				filtered = append(filtered, step)
-			} else {
-				sg.deployment.news.Store(step.URN(), step.Old())
-			}
-		}
-
-		steps = filtered
 	}
 
 	deletingUnspecifiedTarget := false
@@ -2795,7 +2805,15 @@ func (sg *stepGenerator) calculateDependentReplacements(root *resource.State) ([
 	// any resources that depend on the root must not yet have been registered, which in turn implies that resources
 	// that have already been registered must not depend on the root. Thus, we ignore these resources if they are
 	// encountered while walking the old dependency graph to determine the set of dependents.
-	impossibleDependents := sg.urns
+	impossibleDependents := map[resource.URN]bool{}
+	// We can't just use sg.urns here because a resource may have started registration but not yet have been
+	// processed, so instead we have to iterate all the operation maps
+	for _, m := range []map[resource.URN]bool{sg.reads, sg.creates, sg.sames, sg.updates, sg.deletes, sg.replaces} {
+		for urn := range m {
+			impossibleDependents[urn] = true
+		}
+	}
+
 	for _, d := range sg.deployment.depGraph.DependingOn(root, impossibleDependents, false) {
 		replace, keys, err := requiresReplacement(d)
 		if err != nil {
